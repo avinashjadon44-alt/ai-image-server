@@ -1,3 +1,4 @@
+
 from flask import Flask, send_file, jsonify
 import os
 import re
@@ -9,28 +10,26 @@ app = Flask(__name__)
 IMAGE_FOLDER = "images"
 os.makedirs(IMAGE_FOLDER, exist_ok=True)
 
-GEMINI_KEY = "AIzaSyAaGGvPq5i_otoTlVbjUan6Sd6QWIth3x0"
+# 🔐 Secure API key (from Render env)
+GEMINI_KEY = os.environ.get("GEMINI_KEY")
 
 HEADERS = {
     "User-Agent": "ESP32-Image-Backend/1.0"
 }
 
-
+# -------------------------
+# HELPERS
+# -------------------------
 def normalize_topic(topic):
-    """
-    Make topic safe for filenames and URLs.
-    Example: 'red car' -> 'red_car'
-    """
     topic = topic.strip().lower()
     topic = topic.replace(" ", "_")
     topic = re.sub(r"[^a-z0-9_()-]", "", topic)
     return topic
 
-
+# -------------------------
+# WIKIPEDIA IMAGE
+# -------------------------
 def wikipedia_thumbnail_url(topic):
-    """
-    Search Wikipedia for the topic and get a thumbnail URL.
-    """
     api_url = "https://en.wikipedia.org/w/api.php"
 
     params = {
@@ -57,11 +56,10 @@ def wikipedia_thumbnail_url(topic):
 
     return None
 
-
+# -------------------------
+# IMAGE CONVERSION
+# -------------------------
 def convert_image_to_raw(img, raw_path):
-    """
-    Convert PIL image to 320x240 RGB565 raw file.
-    """
     img = img.convert("RGB")
     img = img.resize((320, 240))
 
@@ -72,33 +70,25 @@ def convert_image_to_raw(img, raw_path):
                 rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
                 f.write(bytes([(rgb565 >> 8) & 0xFF, rgb565 & 0xFF]))
 
-
+# -------------------------
+# FETCH IMAGE
+# -------------------------
 def fetch_and_convert(topic):
     safe_topic = normalize_topic(topic)
     raw_path = os.path.join(IMAGE_FOLDER, safe_topic + ".raw")
     jpg_path = os.path.join(IMAGE_FOLDER, safe_topic + ".jpg")
 
-    # Use cached raw if it already exists
     if os.path.exists(raw_path):
-        print("Using cached raw:", raw_path)
         return raw_path
-
-    print("Fetching image for:", topic)
 
     try:
         thumb_url = wikipedia_thumbnail_url(topic)
 
         if not thumb_url:
-            raise Exception("No thumbnail found from Wikipedia")
-
-        print("Thumbnail URL:", thumb_url)
+            raise Exception("No image found")
 
         img_res = requests.get(thumb_url, headers=HEADERS, timeout=20)
         img_res.raise_for_status()
-
-        content_type = img_res.headers.get("Content-Type", "")
-        if "image" not in content_type.lower():
-            raise Exception("Thumbnail response is not an image")
 
         with open(jpg_path, "wb") as f:
             f.write(img_res.content)
@@ -106,31 +96,25 @@ def fetch_and_convert(topic):
         img = Image.open(jpg_path)
         convert_image_to_raw(img, raw_path)
 
-        print("Generated raw:", raw_path)
         return raw_path
 
     except Exception as e:
-        print("Image fetch failed:", e)
-        print("Generating fallback raw...")
+        print("Image error:", e)
 
-        # Fallback: neutral gray image
         img = Image.new("RGB", (320, 240), (96, 96, 96))
         convert_image_to_raw(img, raw_path)
 
-        print("Fallback raw created:", raw_path)
         return raw_path
 
-
+# -------------------------
+# ROUTES
+# -------------------------
 @app.route("/")
 def home():
     return jsonify({
         "status": "ok",
-        "routes": [
-            "/image/<topic>",
-            "/gemini/<topic>"
-        ]
+        "routes": ["/image/<topic>", "/gemini/<topic>"]
     })
-
 
 @app.route("/image/<topic>")
 def get_image(topic):
@@ -140,13 +124,12 @@ def get_image(topic):
     except Exception as e:
         return str(e), 500
 
-
 @app.route("/gemini/<topic>")
 def gemini_text(topic):
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        ""gemini-2.5-flash:generateContent"?key=" + GEMINI_KEY
-    )
+    if not GEMINI_KEY:
+        return jsonify({"error": "API key not set"}), 500
+
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + GEMINI_KEY
 
     payload = {
         "contents": [
@@ -158,16 +141,25 @@ def gemini_text(topic):
         ]
     }
 
+    headers = {
+        "Content-Type": "application/json"
+    }
+
     try:
-        res = requests.post(url, json=payload, headers=HEADERS, timeout=20)
-        res.raise_for_status()
+        res = requests.post(url, json=payload, headers=headers, timeout=20)
         data = res.json()
+
         text = data["candidates"][0]["content"]["parts"][0]["text"]
+
         return jsonify({"text": text})
+
     except Exception as e:
+        print("Gemini error:", e)
         return jsonify({"error": str(e)}), 500
 
-
+# -------------------------
+# START SERVER
+# -------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
