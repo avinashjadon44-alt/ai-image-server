@@ -118,7 +118,25 @@ def home():
 def image(topic):
     refresh = request.args.get("refresh", "0") == "1"
     path = fetch_and_convert(topic, force_refresh=refresh)
-    return send_file(path, mimetype="application/octet-stream")
+
+    file_size = os.path.getsize(path)
+
+    def generate():
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(4096)
+                if not chunk:
+                    break
+                yield chunk
+
+    return Response(
+        generate(),
+        mimetype="application/octet-stream",
+        headers={
+            "Content-Length": str(file_size),
+            "Cache-Control": "no-cache"
+        }
+    )
 
 
 @app.route("/tts")
@@ -152,10 +170,8 @@ def tts():
 @app.route("/full/<topic>")
 def full(topic):
     try:
-        # IMAGE
         fetch_and_convert(topic)
 
-        # GEMINI
         if not GEMINI_KEY:
             return jsonify({"error": "GEMINI_KEY not set"}), 500
 
@@ -178,7 +194,6 @@ def full(topic):
         res.raise_for_status()
 
         data = res.json()
-
         text = data["candidates"][0]["content"]["parts"][0]["text"]
 
         return jsonify({
@@ -190,9 +205,6 @@ def full(topic):
         return jsonify({"error": str(e)}), 500
 
 
-# -------------------------
-# OPTIONAL DEBUG ROUTE
-# -------------------------
 @app.route("/debug_image/<topic>")
 def debug_image(topic):
     try:
@@ -208,7 +220,6 @@ def debug_image(topic):
         }), 500
 
 
-# -------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
