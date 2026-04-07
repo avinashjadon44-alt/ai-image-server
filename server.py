@@ -157,7 +157,10 @@ def tts():
     if not VOICERSS_KEY:
         return "VOICERSS_KEY not set", 500
 
-    text = request.args.get("text", "").strip()
+    text = request.args.get("text", "")
+    text = text.replace("%20", " ")
+    text = text.strip()
+
     if not text:
         return "Missing text", 400
 
