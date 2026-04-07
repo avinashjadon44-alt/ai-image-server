@@ -1,21 +1,29 @@
-from flask import Flask, send_file, jsonify, request, Response
+from flask import Flask, jsonify, request, Response
 import os
 import re
 import requests
 from PIL import Image
 from io import BytesIO
+from google import genai
 
 app = Flask(__name__)
 
 IMAGE_FOLDER = "images"
 os.makedirs(IMAGE_FOLDER, exist_ok=True)
 
-GEMINI_KEY = os.environ.get("GEMINI_KEY")
+# Use one Gemini API key for both text and image
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 VOICERSS_KEY = os.environ.get("VOICERSS_KEY")
+
+if GEMINI_API_KEY:
+    client = genai.Client(api_key=GEMINI_API_KEY)
+else:
+    client = None
 
 HEADERS = {
     "User-Agent": "ESP32-Backend"
 }
+
 
 # -------------------------
 # HELPERS
@@ -25,44 +33,6 @@ def normalize_topic(topic):
     topic = topic.replace(" ", "_")
     topic = re.sub(r"[^a-z0-9_()-]", "", topic)
     return topic
-
-
-def make_gray_raw(raw_path):
-    img = Image.new("RGB", (320, 240), (96, 96, 96))
-    convert_image_to_raw(img, raw_path)
-    return raw_path
-
-
-# -------------------------
-# IMAGE
-# -------------------------
-def wikipedia_thumbnail_url(topic):
-    api_url = "https://en.wikipedia.org/w/api.php"
-
-    params = {
-        "action": "query",
-        "generator": "search",
-        "gsrsearch": topic,
-        "gsrlimit": 1,
-        "prop": "pageimages",
-        "piprop": "thumbnail",
-        "pithumbsize": 640,
-        "format": "json"
-    }
-
-    res = requests.get(api_url, params=params, headers=HEADERS, timeout=20)
-    res.raise_for_status()
-
-    data = res.json()
-    pages = data.get("query", {}).get("pages", {})
-
-    for _, page in pages.items():
-        thumb = page.get("thumbnail", {})
-        source = thumb.get("source")
-        if source:
-            return source
-
-    return None
 
 
 def convert_image_to_raw(img, raw_path):
@@ -77,7 +47,28 @@ def convert_image_to_raw(img, raw_path):
                 f.write(bytes([(rgb565 >> 8) & 0xFF, rgb565 & 0xFF]))
 
 
-def fetch_and_convert(topic, force_refresh=False):
+def make_gray_raw(raw_path):
+    img = Image.new("RGB", (320, 240), (96, 96, 96))
+    convert_image_to_raw(img, raw_path)
+    return raw_path
+
+
+def build_image_prompt(topic):
+    return (
+        f"Create a clean, detailed, realistic image of {topic}. "
+        f"Single clear main subject, centered composition, visually appealing, "
+        f"good lighting, no text, no watermark, no logo, suitable for a small 320x240 display."
+    )
+
+
+def build_text_prompt(topic):
+    return f"In 5 words only: {topic}"
+
+
+# -------------------------
+# GEMINI IMAGE
+# -------------------------
+def generate_gemini_image_raw(topic, force_refresh=False):
     safe = normalize_topic(topic)
     raw_path = os.path.join(IMAGE_FOLDER, safe + ".raw")
 
@@ -85,25 +76,53 @@ def fetch_and_convert(topic, force_refresh=False):
         print("Using cached RAW image:", raw_path)
         return raw_path
 
-    try:
-        url = wikipedia_thumbnail_url(topic)
-        if not url:
-            raise Exception("No thumbnail URL found from Wikipedia")
+    if not client:
+        raise RuntimeError("GEMINI_API_KEY not set")
 
-        print("Thumbnail URL:", url)
+    prompt = build_image_prompt(topic)
+    print("Generating Gemini image for:", topic)
+    print("Prompt:", prompt)
 
-        img_res = requests.get(url, timeout=20, headers=HEADERS)
-        img_res.raise_for_status()
+    # Native Gemini image generation
+    # Docs show this through generate_content with an image-capable Gemini model.
+    response = client.models.generate_content(
+        model="gemini-2.5-flash-image",
+        contents=[prompt],
+    )
 
-        img = Image.open(BytesIO(img_res.content))
-        convert_image_to_raw(img, raw_path)
+    generated_img = None
 
-        print("RAW image created:", raw_path)
-        return raw_path
+    # The docs show image parts arriving as inline_data / as_image()
+    for part in response.parts:
+        if getattr(part, "inline_data", None) is not None:
+            generated_img = part.as_image()
+            break
 
-    except Exception as e:
-        print("IMAGE ERROR:", str(e))
-        return make_gray_raw(raw_path)
+    if generated_img is None:
+        raise RuntimeError("Gemini returned no image part")
+
+    convert_image_to_raw(generated_img, raw_path)
+    print("RAW image created:", raw_path)
+    return raw_path
+
+
+# -------------------------
+# GEMINI TEXT
+# -------------------------
+def get_short_text(topic):
+    if not client:
+        raise RuntimeError("GEMINI_API_KEY not set")
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[build_text_prompt(topic)],
+    )
+
+    text = (response.text or "").strip()
+    if not text:
+        raise RuntimeError("Gemini returned empty text")
+
+    return text
 
 
 # -------------------------
@@ -117,7 +136,14 @@ def home():
 @app.route("/image/<topic>")
 def image(topic):
     refresh = request.args.get("refresh", "0") == "1"
-    path = fetch_and_convert(topic, force_refresh=refresh)
+
+    try:
+        path = generate_gemini_image_raw(topic, force_refresh=refresh)
+    except Exception as e:
+        print("IMAGE ERROR:", str(e))
+        safe = normalize_topic(topic)
+        path = os.path.join(IMAGE_FOLDER, safe + ".raw")
+        path = make_gray_raw(path)
 
     file_size = os.path.getsize(path)
 
@@ -164,42 +190,11 @@ def tts():
     )
 
 
-# -------------------------
-# FULL PIPELINE
-# -------------------------
 @app.route("/full/<topic>")
 def full(topic):
     try:
-        fetch_and_convert(topic)
-
-        if not GEMINI_KEY:
-            return jsonify({"error": "GEMINI_KEY not set"}), 500
-
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            "gemini-2.5-flash:generateContent?key=" + GEMINI_KEY
-        )
-
-        payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {"text": "In 5 words: " + topic}
-                    ]
-                }
-            ]
-        }
-
-        res = requests.post(url, json=payload, timeout=30)
-        res.raise_for_status()
-
-        data = res.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-
-        return jsonify({
-            "text": text
-        })
-
+        text = get_short_text(topic)
+        return jsonify({"text": text})
     except Exception as e:
         print("FULL ERROR:", str(e))
         return jsonify({"error": str(e)}), 500
@@ -208,10 +203,14 @@ def full(topic):
 @app.route("/debug_image/<topic>")
 def debug_image(topic):
     try:
-        url = wikipedia_thumbnail_url(topic)
+        safe = normalize_topic(topic)
+        raw_path = os.path.join(IMAGE_FOLDER, safe + ".raw")
+
         return jsonify({
             "topic": topic,
-            "thumbnail_url": url
+            "prompt": build_image_prompt(topic),
+            "cached": os.path.exists(raw_path),
+            "raw_path": raw_path
         })
     except Exception as e:
         return jsonify({
