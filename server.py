@@ -13,17 +13,21 @@ GEMINI_KEY = os.environ.get("GEMINI_KEY")
 VOICERSS_KEY = os.environ.get("VOICERSS_KEY")
 
 HEADERS = {
-    "User-Agent": "ESP32-Image-Backend/1.0"
+    "User-Agent": "ESP32-Backend"
 }
 
-
+# -------------------------
+# HELPERS
+# -------------------------
 def normalize_topic(topic):
     topic = topic.strip().lower()
     topic = topic.replace(" ", "_")
     topic = re.sub(r"[^a-z0-9_()-]", "", topic)
     return topic
 
-
+# -------------------------
+# IMAGE
+# -------------------------
 def wikipedia_thumbnail_url(topic):
     api_url = "https://en.wikipedia.org/w/api.php"
 
@@ -39,7 +43,6 @@ def wikipedia_thumbnail_url(topic):
     }
 
     res = requests.get(api_url, params=params, headers=HEADERS, timeout=20)
-    res.raise_for_status()
     data = res.json()
 
     pages = data.get("query", {}).get("pages", {})
@@ -65,128 +68,89 @@ def convert_image_to_raw(img, raw_path):
 
 
 def fetch_and_convert(topic):
-    safe_topic = normalize_topic(topic)
-    raw_path = os.path.join(IMAGE_FOLDER, safe_topic + ".raw")
-    jpg_path = os.path.join(IMAGE_FOLDER, safe_topic + ".jpg")
+    safe = normalize_topic(topic)
+    raw_path = os.path.join(IMAGE_FOLDER, safe + ".raw")
 
     if os.path.exists(raw_path):
-        print("Using cached raw:", raw_path)
         return raw_path
-
-    print("Fetching image for:", topic)
 
     try:
-        thumb_url = wikipedia_thumbnail_url(topic)
+        url = wikipedia_thumbnail_url(topic)
+        img_res = requests.get(url, timeout=20)
 
-        if not thumb_url:
-            raise Exception("No image found")
-
-        img_res = requests.get(thumb_url, headers=HEADERS, timeout=20)
-        img_res.raise_for_status()
-
-        with open(jpg_path, "wb") as f:
-            f.write(img_res.content)
-
-        img = Image.open(jpg_path)
+        img = Image.open(requests.compat.BytesIO(img_res.content))
         convert_image_to_raw(img, raw_path)
 
         return raw_path
 
-    except Exception as e:
-        print("Image error:", e)
-
+    except:
         img = Image.new("RGB", (320, 240), (96, 96, 96))
         convert_image_to_raw(img, raw_path)
-
         return raw_path
 
 
+# -------------------------
+# ROUTES
+# -------------------------
 @app.route("/")
 def home():
-    return jsonify({
-        "status": "ok",
-        "routes": ["/image/<topic>", "/gemini/<topic>", "/tts?text=..."]
-    })
+    return "OK"
 
 
 @app.route("/image/<topic>")
-def get_image(topic):
-    try:
-        path = fetch_and_convert(topic)
-        return send_file(path, mimetype="application/octet-stream")
-    except Exception as e:
-        return str(e), 500
-
-
-@app.route("/gemini/<topic>")
-def gemini_text(topic):
-    if not GEMINI_KEY:
-        return jsonify({"error": "GEMINI_KEY not set"}), 500
-
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + GEMINI_KEY
-
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": "In 5 words: " + topic}
-                ]
-            }
-        ]
-    }
-
-    headers = {
-        "Content-Type": "application/json"
-    }
-
-    try:
-        res = requests.post(url, json=payload, headers=headers, timeout=20)
-        res.raise_for_status()
-        data = res.json()
-
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-        return jsonify({"text": text})
-
-    except Exception as e:
-        print("Gemini error:", e)
-        return jsonify({"error": str(e)}), 500
+def image(topic):
+    path = fetch_and_convert(topic)
+    return send_file(path, mimetype="application/octet-stream")
 
 
 @app.route("/tts")
 def tts():
-    if not VOICERSS_KEY:
-        return "VOICERSS_KEY not set", 500
-
     text = request.args.get("text", "")
-    text = text.replace("%20", " ")
-    text = text.strip()
-
-    if not text:
-        return "Missing text", 400
+    text = text.replace("%20", " ").strip()
 
     url = (
-        "https://api.voicerss.org/"
-        "?key=" + VOICERSS_KEY +
-        "&hl=en-us" +
-        "&src=" + requests.utils.quote(text) +
-        "&f=8khz_8bit_mono_pcm" +
-        "&codec=PCM"
+        "https://api.voicerss.org/?key=" + VOICERSS_KEY +
+        "&hl=en-us&src=" + requests.utils.quote(text) +
+        "&f=8khz_8bit_mono_pcm&codec=PCM"
     )
 
-    try:
-        r = requests.get(url, stream=True, timeout=30)
-        r.raise_for_status()
+    r = requests.get(url, stream=True)
 
-        return Response(
-            r.iter_content(chunk_size=512),
-            content_type="application/octet-stream"
-        )
+    return Response(r.iter_content(512),
+                    content_type="application/octet-stream")
+
+
+# -------------------------
+# 🔥 FULL PIPELINE
+# -------------------------
+@app.route("/full/<topic>")
+def full(topic):
+    try:
+        # IMAGE
+        fetch_and_convert(topic)
+
+        # GEMINI
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + GEMINI_KEY
+
+        payload = {
+            "contents": [
+                {"parts": [{"text": "In 5 words: " + topic}]}
+            ]
+        }
+
+        res = requests.post(url, json=payload, timeout=20)
+        data = res.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+
+        return jsonify({
+            "text": text
+        })
 
     except Exception as e:
-        print("TTS error:", e)
-        return str(e), 500
+        return jsonify({"error": str(e)}), 500
 
 
+# -------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
