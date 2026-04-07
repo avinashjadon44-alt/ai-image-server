@@ -145,7 +145,7 @@ def get_image(topic):
 def gemini_text(topic):
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-3.1-flash-lite-preview:generateContent?key=" + GEMINI_KEY
+        ""gemini-2.5-flash:generateContent"?key=" + GEMINI_KEY
     )
 
     payload = {
