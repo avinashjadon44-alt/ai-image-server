@@ -3,6 +3,7 @@ import os
 import re
 import requests
 from PIL import Image
+from io import BytesIO
 
 app = Flask(__name__)
 
@@ -25,6 +26,13 @@ def normalize_topic(topic):
     topic = re.sub(r"[^a-z0-9_()-]", "", topic)
     return topic
 
+
+def make_gray_raw(raw_path):
+    img = Image.new("RGB", (320, 240), (96, 96, 96))
+    convert_image_to_raw(img, raw_path)
+    return raw_path
+
+
 # -------------------------
 # IMAGE
 # -------------------------
@@ -43,9 +51,11 @@ def wikipedia_thumbnail_url(topic):
     }
 
     res = requests.get(api_url, params=params, headers=HEADERS, timeout=20)
-    data = res.json()
+    res.raise_for_status()
 
+    data = res.json()
     pages = data.get("query", {}).get("pages", {})
+
     for _, page in pages.items():
         thumb = page.get("thumbnail", {})
         source = thumb.get("source")
@@ -67,26 +77,33 @@ def convert_image_to_raw(img, raw_path):
                 f.write(bytes([(rgb565 >> 8) & 0xFF, rgb565 & 0xFF]))
 
 
-def fetch_and_convert(topic):
+def fetch_and_convert(topic, force_refresh=False):
     safe = normalize_topic(topic)
     raw_path = os.path.join(IMAGE_FOLDER, safe + ".raw")
 
-    if os.path.exists(raw_path):
+    if os.path.exists(raw_path) and not force_refresh:
+        print("Using cached RAW image:", raw_path)
         return raw_path
 
     try:
         url = wikipedia_thumbnail_url(topic)
-        img_res = requests.get(url, timeout=20)
+        if not url:
+            raise Exception("No thumbnail URL found from Wikipedia")
 
-        img = Image.open(requests.compat.BytesIO(img_res.content))
+        print("Thumbnail URL:", url)
+
+        img_res = requests.get(url, timeout=20, headers=HEADERS)
+        img_res.raise_for_status()
+
+        img = Image.open(BytesIO(img_res.content))
         convert_image_to_raw(img, raw_path)
 
+        print("RAW image created:", raw_path)
         return raw_path
 
-    except:
-        img = Image.new("RGB", (320, 240), (96, 96, 96))
-        convert_image_to_raw(img, raw_path)
-        return raw_path
+    except Exception as e:
+        print("IMAGE ERROR:", str(e))
+        return make_gray_raw(raw_path)
 
 
 # -------------------------
@@ -99,14 +116,20 @@ def home():
 
 @app.route("/image/<topic>")
 def image(topic):
-    path = fetch_and_convert(topic)
+    refresh = request.args.get("refresh", "0") == "1"
+    path = fetch_and_convert(topic, force_refresh=refresh)
     return send_file(path, mimetype="application/octet-stream")
 
 
 @app.route("/tts")
 def tts():
-    text = request.args.get("text", "")
-    text = text.replace("%20", " ").strip()
+    text = request.args.get("text", "").strip()
+
+    if not text:
+        return Response("Missing text", status=400)
+
+    if not VOICERSS_KEY:
+        return Response("VOICERSS_KEY not set", status=500)
 
     url = (
         "https://api.voicerss.org/?key=" + VOICERSS_KEY +
@@ -114,14 +137,17 @@ def tts():
         "&f=8khz_8bit_mono_pcm&codec=PCM"
     )
 
-    r = requests.get(url, stream=True)
+    r = requests.get(url, stream=True, timeout=30)
+    r.raise_for_status()
 
-    return Response(r.iter_content(512),
-                    content_type="application/octet-stream")
+    return Response(
+        r.iter_content(512),
+        content_type="application/octet-stream"
+    )
 
 
 # -------------------------
-# 🔥 FULL PIPELINE
+# FULL PIPELINE
 # -------------------------
 @app.route("/full/<topic>")
 def full(topic):
@@ -130,16 +156,29 @@ def full(topic):
         fetch_and_convert(topic)
 
         # GEMINI
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + GEMINI_KEY
+        if not GEMINI_KEY:
+            return jsonify({"error": "GEMINI_KEY not set"}), 500
+
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "gemini-2.5-flash:generateContent?key=" + GEMINI_KEY
+        )
 
         payload = {
             "contents": [
-                {"parts": [{"text": "In 5 words: " + topic}]}
+                {
+                    "parts": [
+                        {"text": "In 5 words: " + topic}
+                    ]
+                }
             ]
         }
 
-        res = requests.post(url, json=payload, timeout=20)
+        res = requests.post(url, json=payload, timeout=30)
+        res.raise_for_status()
+
         data = res.json()
+
         text = data["candidates"][0]["content"]["parts"][0]["text"]
 
         return jsonify({
@@ -147,7 +186,26 @@ def full(topic):
         })
 
     except Exception as e:
+        print("FULL ERROR:", str(e))
         return jsonify({"error": str(e)}), 500
+
+
+# -------------------------
+# OPTIONAL DEBUG ROUTE
+# -------------------------
+@app.route("/debug_image/<topic>")
+def debug_image(topic):
+    try:
+        url = wikipedia_thumbnail_url(topic)
+        return jsonify({
+            "topic": topic,
+            "thumbnail_url": url
+        })
+    except Exception as e:
+        return jsonify({
+            "topic": topic,
+            "error": str(e)
+        }), 500
 
 
 # -------------------------
