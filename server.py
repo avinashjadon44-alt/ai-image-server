@@ -5,6 +5,7 @@ from io import BytesIO
 from PIL import Image
 import requests
 from google import genai
+import base64
 
 app = Flask(__name__)
 
@@ -54,11 +55,49 @@ def build_text_prompt(topic):
     return f"In 5 words only: {topic}"
 
 
+def extract_pil_image_from_response(response):
+    # Try candidates -> content -> parts
+    candidates = getattr(response, "candidates", None) or []
+    for cand in candidates:
+        content = getattr(cand, "content", None)
+        parts = getattr(content, "parts", None) or []
+        for part in parts:
+            inline_data = getattr(part, "inline_data", None)
+            if inline_data is not None:
+                data = getattr(inline_data, "data", None)
+                mime_type = getattr(inline_data, "mime_type", None)
+                print("Found inline_data mime_type:", mime_type)
+
+                if isinstance(data, (bytes, bytearray)):
+                    return Image.open(BytesIO(data))
+
+                if isinstance(data, str):
+                    return Image.open(BytesIO(base64.b64decode(data)))
+
+    # Try top-level parts
+    top_parts = getattr(response, "parts", None) or []
+    for part in top_parts:
+        inline_data = getattr(part, "inline_data", None)
+        if inline_data is not None:
+            data = getattr(inline_data, "data", None)
+            mime_type = getattr(inline_data, "mime_type", None)
+            print("Found top-level inline_data mime_type:", mime_type)
+
+            if isinstance(data, (bytes, bytearray)):
+                return Image.open(BytesIO(data))
+
+            if isinstance(data, str):
+                return Image.open(BytesIO(base64.b64decode(data)))
+
+    return None
+
+
 def generate_gemini_image_raw(topic, force_refresh=False):
     safe = normalize_topic(topic)
     raw_path = os.path.join(IMAGE_FOLDER, safe + ".raw")
 
     if os.path.exists(raw_path) and not force_refresh:
+        print("IMAGE SOURCE: cache")
         print("Using cached RAW image:", raw_path)
         return raw_path, "cache"
 
@@ -74,52 +113,14 @@ def generate_gemini_image_raw(topic, force_refresh=False):
         contents=prompt,
     )
 
-    # Robust extraction across SDK response layouts
-    pil_img = None
+    print("Gemini image response type:", type(response))
 
-    candidates = getattr(response, "candidates", None) or []
-    for cand in candidates:
-        content = getattr(cand, "content", None)
-        parts = getattr(content, "parts", None) or []
-        for part in parts:
-            inline_data = getattr(part, "inline_data", None)
-            if inline_data is not None:
-                data = getattr(inline_data, "data", None)
-                mime_type = getattr(inline_data, "mime_type", None)
-                if data:
-                    img_bytes = data if isinstance(data, (bytes, bytearray)) else None
-                    if img_bytes is None and isinstance(data, str):
-                        import base64
-                        img_bytes = base64.b64decode(data)
-                    if img_bytes:
-                        print("Gemini image mime_type:", mime_type)
-                        pil_img = Image.open(BytesIO(img_bytes))
-                        break
-        if pil_img is not None:
-            break
-
-    # Fallback for SDKs exposing top-level parts
+    pil_img = extract_pil_image_from_response(response)
     if pil_img is None:
-        top_parts = getattr(response, "parts", None) or []
-        for part in top_parts:
-            inline_data = getattr(part, "inline_data", None)
-            if inline_data is not None:
-                data = getattr(inline_data, "data", None)
-                mime_type = getattr(inline_data, "mime_type", None)
-                if data:
-                    img_bytes = data if isinstance(data, (bytes, bytearray)) else None
-                    if img_bytes is None and isinstance(data, str):
-                        import base64
-                        img_bytes = base64.b64decode(data)
-                    if img_bytes:
-                        print("Gemini image mime_type:", mime_type)
-                        pil_img = Image.open(BytesIO(img_bytes))
-                        break
-
-    if pil_img is None:
-        raise RuntimeError(f"Gemini returned no image part. Raw response type: {type(response)}")
+        raise RuntimeError("Gemini returned no image part")
 
     convert_image_to_raw(pil_img, raw_path)
+    print("IMAGE SOURCE: generated")
     print("RAW image created:", raw_path)
     return raw_path, "generated"
 
@@ -151,7 +152,7 @@ def image(topic):
 
     try:
         path, source = generate_gemini_image_raw(topic, force_refresh=refresh)
-        print("IMAGE SOURCE:", source)
+        print("Final image source:", source)
     except Exception as e:
         print("IMAGE ERROR:", str(e))
         safe = normalize_topic(topic)
@@ -177,6 +178,22 @@ def image(topic):
             "Cache-Control": "no-cache"
         }
     )
+
+
+@app.route("/test_image/<topic>")
+def test_image(topic):
+    try:
+        path, source = generate_gemini_image_raw(topic, force_refresh=True)
+        return jsonify({
+            "ok": True,
+            "source": source,
+            "path": path
+        })
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": str(e)
+        }), 500
 
 
 @app.route("/full/<topic>")
