@@ -1,9 +1,9 @@
 from flask import Flask, jsonify, request, Response
 import os
 import re
-import requests
-from PIL import Image
 from io import BytesIO
+from PIL import Image
+import requests
 from google import genai
 
 app = Flask(__name__)
@@ -11,23 +11,12 @@ app = Flask(__name__)
 IMAGE_FOLDER = "images"
 os.makedirs(IMAGE_FOLDER, exist_ok=True)
 
-# Use one Gemini API key for both text and image
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 VOICERSS_KEY = os.environ.get("VOICERSS_KEY")
 
-if GEMINI_API_KEY:
-    client = genai.Client(api_key=GEMINI_API_KEY)
-else:
-    client = None
-
-HEADERS = {
-    "User-Agent": "ESP32-Backend"
-}
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 
-# -------------------------
-# HELPERS
-# -------------------------
 def normalize_topic(topic):
     topic = topic.strip().lower()
     topic = topic.replace(" ", "_")
@@ -65,16 +54,13 @@ def build_text_prompt(topic):
     return f"In 5 words only: {topic}"
 
 
-# -------------------------
-# GEMINI IMAGE
-# -------------------------
 def generate_gemini_image_raw(topic, force_refresh=False):
     safe = normalize_topic(topic)
     raw_path = os.path.join(IMAGE_FOLDER, safe + ".raw")
 
     if os.path.exists(raw_path) and not force_refresh:
         print("Using cached RAW image:", raw_path)
-        return raw_path
+        return raw_path, "cache"
 
     if not client:
         raise RuntimeError("GEMINI_API_KEY not set")
@@ -83,51 +69,77 @@ def generate_gemini_image_raw(topic, force_refresh=False):
     print("Generating Gemini image for:", topic)
     print("Prompt:", prompt)
 
-    # Native Gemini image generation
-    # Docs show this through generate_content with an image-capable Gemini model.
     response = client.models.generate_content(
         model="gemini-2.5-flash-image",
-        contents=[prompt],
+        contents=prompt,
     )
 
-    generated_img = None
+    # Robust extraction across SDK response layouts
+    pil_img = None
 
-    # The docs show image parts arriving as inline_data / as_image()
-    for part in response.parts:
-        if getattr(part, "inline_data", None) is not None:
-            generated_img = part.as_image()
+    candidates = getattr(response, "candidates", None) or []
+    for cand in candidates:
+        content = getattr(cand, "content", None)
+        parts = getattr(content, "parts", None) or []
+        for part in parts:
+            inline_data = getattr(part, "inline_data", None)
+            if inline_data is not None:
+                data = getattr(inline_data, "data", None)
+                mime_type = getattr(inline_data, "mime_type", None)
+                if data:
+                    img_bytes = data if isinstance(data, (bytes, bytearray)) else None
+                    if img_bytes is None and isinstance(data, str):
+                        import base64
+                        img_bytes = base64.b64decode(data)
+                    if img_bytes:
+                        print("Gemini image mime_type:", mime_type)
+                        pil_img = Image.open(BytesIO(img_bytes))
+                        break
+        if pil_img is not None:
             break
 
-    if generated_img is None:
-        raise RuntimeError("Gemini returned no image part")
+    # Fallback for SDKs exposing top-level parts
+    if pil_img is None:
+        top_parts = getattr(response, "parts", None) or []
+        for part in top_parts:
+            inline_data = getattr(part, "inline_data", None)
+            if inline_data is not None:
+                data = getattr(inline_data, "data", None)
+                mime_type = getattr(inline_data, "mime_type", None)
+                if data:
+                    img_bytes = data if isinstance(data, (bytes, bytearray)) else None
+                    if img_bytes is None and isinstance(data, str):
+                        import base64
+                        img_bytes = base64.b64decode(data)
+                    if img_bytes:
+                        print("Gemini image mime_type:", mime_type)
+                        pil_img = Image.open(BytesIO(img_bytes))
+                        break
 
-    convert_image_to_raw(generated_img, raw_path)
+    if pil_img is None:
+        raise RuntimeError(f"Gemini returned no image part. Raw response type: {type(response)}")
+
+    convert_image_to_raw(pil_img, raw_path)
     print("RAW image created:", raw_path)
-    return raw_path
+    return raw_path, "generated"
 
 
-# -------------------------
-# GEMINI TEXT
-# -------------------------
 def get_short_text(topic):
     if not client:
         raise RuntimeError("GEMINI_API_KEY not set")
 
     response = client.models.generate_content(
         model="gemini-2.5-flash",
-        contents=[build_text_prompt(topic)],
+        contents=build_text_prompt(topic),
     )
 
-    text = (response.text or "").strip()
+    text = (getattr(response, "text", "") or "").strip()
     if not text:
         raise RuntimeError("Gemini returned empty text")
 
     return text
 
 
-# -------------------------
-# ROUTES
-# -------------------------
 @app.route("/")
 def home():
     return "OK"
@@ -138,12 +150,14 @@ def image(topic):
     refresh = request.args.get("refresh", "0") == "1"
 
     try:
-        path = generate_gemini_image_raw(topic, force_refresh=refresh)
+        path, source = generate_gemini_image_raw(topic, force_refresh=refresh)
+        print("IMAGE SOURCE:", source)
     except Exception as e:
         print("IMAGE ERROR:", str(e))
         safe = normalize_topic(topic)
         path = os.path.join(IMAGE_FOLDER, safe + ".raw")
         path = make_gray_raw(path)
+        print("IMAGE SOURCE: gray-fallback")
 
     file_size = os.path.getsize(path)
 
@@ -165,6 +179,15 @@ def image(topic):
     )
 
 
+@app.route("/full/<topic>")
+def full(topic):
+    try:
+        return jsonify({"text": get_short_text(topic)})
+    except Exception as e:
+        print("FULL ERROR:", str(e))
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/tts")
 def tts():
     text = request.args.get("text", "").strip()
@@ -184,39 +207,20 @@ def tts():
     r = requests.get(url, stream=True, timeout=30)
     r.raise_for_status()
 
-    return Response(
-        r.iter_content(512),
-        content_type="application/octet-stream"
-    )
-
-
-@app.route("/full/<topic>")
-def full(topic):
-    try:
-        text = get_short_text(topic)
-        return jsonify({"text": text})
-    except Exception as e:
-        print("FULL ERROR:", str(e))
-        return jsonify({"error": str(e)}), 500
+    return Response(r.iter_content(512), content_type="application/octet-stream")
 
 
 @app.route("/debug_image/<topic>")
 def debug_image(topic):
-    try:
-        safe = normalize_topic(topic)
-        raw_path = os.path.join(IMAGE_FOLDER, safe + ".raw")
-
-        return jsonify({
-            "topic": topic,
-            "prompt": build_image_prompt(topic),
-            "cached": os.path.exists(raw_path),
-            "raw_path": raw_path
-        })
-    except Exception as e:
-        return jsonify({
-            "topic": topic,
-            "error": str(e)
-        }), 500
+    safe = normalize_topic(topic)
+    raw_path = os.path.join(IMAGE_FOLDER, safe + ".raw")
+    return jsonify({
+        "topic": topic,
+        "prompt": build_image_prompt(topic),
+        "cached_exists": os.path.exists(raw_path),
+        "raw_path": raw_path,
+        "gemini_key_present": bool(GEMINI_API_KEY),
+    })
 
 
 if __name__ == "__main__":
