@@ -1,11 +1,12 @@
 from flask import Flask, jsonify, request, Response
 import os
 import re
+import base64
 from io import BytesIO
+
 from PIL import Image
 import requests
 from google import genai
-import base64
 
 app = Flask(__name__)
 
@@ -15,9 +16,15 @@ os.makedirs(IMAGE_FOLDER, exist_ok=True)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 VOICERSS_KEY = os.environ.get("VOICERSS_KEY")
 
+IMAGE_MODEL = "gemini-2.5-flash-image"
+TEXT_MODEL = "gemini-2.5-flash"
+
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 
+# -------------------------
+# HELPERS
+# -------------------------
 def normalize_topic(topic):
     topic = topic.strip().lower()
     topic = topic.replace(" ", "_")
@@ -56,7 +63,7 @@ def build_text_prompt(topic):
 
 
 def extract_pil_image_from_response(response):
-    # Try candidates -> content -> parts
+    # candidates -> content -> parts
     candidates = getattr(response, "candidates", None) or []
     for cand in candidates:
         content = getattr(cand, "content", None)
@@ -66,7 +73,7 @@ def extract_pil_image_from_response(response):
             if inline_data is not None:
                 data = getattr(inline_data, "data", None)
                 mime_type = getattr(inline_data, "mime_type", None)
-                print("Found inline_data mime_type:", mime_type)
+                print("Found candidate inline_data mime_type:", mime_type)
 
                 if isinstance(data, (bytes, bytearray)):
                     return Image.open(BytesIO(data))
@@ -74,7 +81,7 @@ def extract_pil_image_from_response(response):
                 if isinstance(data, str):
                     return Image.open(BytesIO(base64.b64decode(data)))
 
-    # Try top-level parts
+    # top-level parts
     top_parts = getattr(response, "parts", None) or []
     for part in top_parts:
         inline_data = getattr(part, "inline_data", None)
@@ -92,6 +99,29 @@ def extract_pil_image_from_response(response):
     return None
 
 
+def classify_exception(exc):
+    msg = str(exc)
+    lowered = msg.lower()
+
+    info = {
+        "type": type(exc).__name__,
+        "message": msg,
+        "is_quota_error": False,
+        "is_rate_limit": False,
+        "retryable": False,
+    }
+
+    if "resource_exhausted" in lowered or "quota exceeded" in lowered or "429" in lowered:
+        info["is_quota_error"] = True
+        info["is_rate_limit"] = True
+        info["retryable"] = True
+
+    return info
+
+
+# -------------------------
+# GEMINI IMAGE
+# -------------------------
 def generate_gemini_image_raw(topic, force_refresh=False):
     safe = normalize_topic(topic)
     raw_path = os.path.join(IMAGE_FOLDER, safe + ".raw")
@@ -106,10 +136,11 @@ def generate_gemini_image_raw(topic, force_refresh=False):
 
     prompt = build_image_prompt(topic)
     print("Generating Gemini image for:", topic)
+    print("Image model:", IMAGE_MODEL)
     print("Prompt:", prompt)
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash-image",
+        model=IMAGE_MODEL,
         contents=prompt,
     )
 
@@ -125,12 +156,15 @@ def generate_gemini_image_raw(topic, force_refresh=False):
     return raw_path, "generated"
 
 
+# -------------------------
+# GEMINI TEXT
+# -------------------------
 def get_short_text(topic):
     if not client:
         raise RuntimeError("GEMINI_API_KEY not set")
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=TEXT_MODEL,
         contents=build_text_prompt(topic),
     )
 
@@ -141,6 +175,9 @@ def get_short_text(topic):
     return text
 
 
+# -------------------------
+# ROUTES
+# -------------------------
 @app.route("/")
 def home():
     return "OK"
@@ -149,12 +186,28 @@ def home():
 @app.route("/image/<topic>")
 def image(topic):
     refresh = request.args.get("refresh", "0") == "1"
+    fallback = request.args.get("fallback", "1") == "1"
 
     try:
         path, source = generate_gemini_image_raw(topic, force_refresh=refresh)
         print("Final image source:", source)
+
     except Exception as e:
-        print("IMAGE ERROR:", str(e))
+        err = classify_exception(e)
+        print("IMAGE ERROR:", err["message"])
+
+        if not fallback:
+            status = 429 if err["is_quota_error"] else 500
+            return jsonify({
+                "ok": False,
+                "error": err["message"],
+                "error_type": err["type"],
+                "is_quota_error": err["is_quota_error"],
+                "retryable": err["retryable"],
+                "model": IMAGE_MODEL,
+                "topic": topic,
+            }), status
+
         safe = normalize_topic(topic)
         path = os.path.join(IMAGE_FOLDER, safe + ".raw")
         path = make_gray_raw(path)
@@ -187,19 +240,33 @@ def test_image(topic):
         return jsonify({
             "ok": True,
             "source": source,
-            "path": path
+            "path": path,
+            "model": IMAGE_MODEL,
+            "topic": topic,
         })
     except Exception as e:
+        err = classify_exception(e)
+        status = 429 if err["is_quota_error"] else 500
         return jsonify({
             "ok": False,
-            "error": str(e)
-        }), 500
+            "error": err["message"],
+            "error_type": err["type"],
+            "is_quota_error": err["is_quota_error"],
+            "is_rate_limit": err["is_rate_limit"],
+            "retryable": err["retryable"],
+            "model": IMAGE_MODEL,
+            "topic": topic,
+            "prompt": build_image_prompt(topic),
+        }), status
 
 
 @app.route("/full/<topic>")
 def full(topic):
     try:
-        return jsonify({"text": get_short_text(topic)})
+        return jsonify({
+            "text": get_short_text(topic),
+            "model": TEXT_MODEL
+        })
     except Exception as e:
         print("FULL ERROR:", str(e))
         return jsonify({"error": str(e)}), 500
@@ -237,6 +304,8 @@ def debug_image(topic):
         "cached_exists": os.path.exists(raw_path),
         "raw_path": raw_path,
         "gemini_key_present": bool(GEMINI_API_KEY),
+        "image_model": IMAGE_MODEL,
+        "text_model": TEXT_MODEL,
     })
 
 
