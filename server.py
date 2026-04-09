@@ -4,7 +4,6 @@ import re
 import requests
 from PIL import Image
 from io import BytesIO
-from urllib.parse import quote
 
 app = Flask(__name__)
 
@@ -20,8 +19,8 @@ HEADERS = {
     "User-Agent": "ESP32-Backend"
 }
 
-RAW_W = 300
-RAW_H = 150
+RAW_W = 304
+RAW_H = 145
 
 
 # -------------------------
@@ -53,34 +52,25 @@ def load_topic():
     return topic
 
 
-def center_crop_to_fill(img, target_w, target_h):
+def fit_image_centered(img, target_w, target_h, bg_color=(0, 0, 0)):
     img = img.convert("RGB")
     src_w, src_h = img.size
 
-    src_ratio = src_w / src_h
-    dst_ratio = target_w / target_h
+    scale = min(target_w / src_w, target_h / src_h)
+    new_w = max(1, int(src_w * scale))
+    new_h = max(1, int(src_h * scale))
 
-    if src_ratio > dst_ratio:
-        new_h = src_h
-        new_w = int(src_h * dst_ratio)
-        left = (src_w - new_w) // 2
-        top = 0
-    else:
-        new_w = src_w
-        new_h = int(src_w / dst_ratio)
-        left = 0
-        top = (src_h - new_h) // 2
+    img = img.resize((new_w, new_h), Image.LANCZOS)
 
-    right = left + new_w
-    bottom = top + new_h
-
-    img = img.crop((left, top, right, bottom))
-    img = img.resize((target_w, target_h), Image.LANCZOS)
-    return img
+    canvas = Image.new("RGB", (target_w, target_h), bg_color)
+    x = (target_w - new_w) // 2
+    y = (target_h - new_h) // 2
+    canvas.paste(img, (x, y))
+    return canvas
 
 
 def convert_image_to_raw(img, raw_path):
-    img = center_crop_to_fill(img, RAW_W, RAW_H)
+    img = fit_image_centered(img, RAW_W, RAW_H, bg_color=(0, 0, 0))
 
     with open(raw_path, "wb") as f:
         for y in range(RAW_H):
@@ -158,53 +148,37 @@ def fetch_and_convert(topic, force_refresh=False):
 
 
 # -------------------------
-# TEXT
+# GEMINI TEXT ONLY
 # -------------------------
-def wikipedia_summary(topic):
-    url = "https://en.wikipedia.org/api/rest_v1/page/summary/" + quote(topic)
-    res = requests.get(url, headers=HEADERS, timeout=20)
+def get_short_text(topic):
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY not set")
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-2.5-flash:generateContent?key=" + GEMINI_API_KEY
+    )
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": "Explain in one or two short sentences only: " + topic}
+                ]
+            }
+        ]
+    }
+
+    res = requests.post(url, json=payload, timeout=30)
     res.raise_for_status()
 
     data = res.json()
-    text = data.get("extract", "").strip()
 
+    text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
     if not text:
-      raise RuntimeError("Wikipedia summary empty")
+        raise RuntimeError("Gemini returned empty text")
 
     return text
-
-
-def get_short_text(topic):
-    if GEMINI_API_KEY:
-        try:
-            url = (
-                "https://generativelanguage.googleapis.com/v1beta/models/"
-                "gemini-2.5-flash:generateContent?key=" + GEMINI_API_KEY
-            )
-
-            payload = {
-                "contents": [
-                    {
-                        "parts": [
-                            {"text": "Explain in one or two short sentences only: " + topic}
-                        ]
-                    }
-                ]
-            }
-
-            res = requests.post(url, json=payload, timeout=30)
-            res.raise_for_status()
-
-            data = res.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            if text:
-                return text
-
-        except Exception as e:
-            print("GEMINI TEXT ERROR:", str(e))
-
-    # Fallback to Wikipedia summary
-    return wikipedia_summary(topic)
 
 
 # -------------------------
