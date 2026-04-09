@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, Response
+from flask import Flask, send_file, jsonify, request, Response
 import os
 import re
 import requests
@@ -18,10 +18,6 @@ VOICERSS_KEY = os.environ.get("VOICERSS_KEY")
 HEADERS = {
     "User-Agent": "ESP32-Backend"
 }
-
-RAW_W = 304
-RAW_H = 145
-
 
 # -------------------------
 # HELPERS
@@ -52,36 +48,8 @@ def load_topic():
     return topic
 
 
-def fit_image_centered(img, target_w, target_h, bg_color=(0, 0, 0)):
-    img = img.convert("RGB")
-    src_w, src_h = img.size
-
-    scale = min(target_w / src_w, target_h / src_h)
-    new_w = max(1, int(src_w * scale))
-    new_h = max(1, int(src_h * scale))
-
-    img = img.resize((new_w, new_h), Image.LANCZOS)
-
-    canvas = Image.new("RGB", (target_w, target_h), bg_color)
-    x = (target_w - new_w) // 2
-    y = (target_h - new_h) // 2
-    canvas.paste(img, (x, y))
-    return canvas
-
-
-def convert_image_to_raw(img, raw_path):
-    img = fit_image_centered(img, RAW_W, RAW_H, bg_color=(0, 0, 0))
-
-    with open(raw_path, "wb") as f:
-        for y in range(RAW_H):
-            for x in range(RAW_W):
-                r, g, b = img.getpixel((x, y))
-                rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-                f.write(bytes([(rgb565 >> 8) & 0xFF, rgb565 & 0xFF]))
-
-
 def make_gray_raw(raw_path):
-    img = Image.new("RGB", (RAW_W, RAW_H), (96, 96, 96))
+    img = Image.new("RGB", (320, 240), (96, 96, 96))
     convert_image_to_raw(img, raw_path)
     return raw_path
 
@@ -99,7 +67,7 @@ def wikipedia_thumbnail_url(topic):
         "gsrlimit": 1,
         "prop": "pageimages",
         "piprop": "thumbnail",
-        "pithumbsize": 900,
+        "pithumbsize": 640,
         "format": "json"
     }
 
@@ -116,6 +84,18 @@ def wikipedia_thumbnail_url(topic):
             return source
 
     return None
+
+
+def convert_image_to_raw(img, raw_path):
+    img = img.convert("RGB")
+    img = img.resize((320, 240))
+
+    with open(raw_path, "wb") as f:
+        for y in range(240):
+            for x in range(320):
+                r, g, b = img.getpixel((x, y))
+                rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+                f.write(bytes([(rgb565 >> 8) & 0xFF, rgb565 & 0xFF]))
 
 
 def fetch_and_convert(topic, force_refresh=False):
@@ -148,7 +128,7 @@ def fetch_and_convert(topic, force_refresh=False):
 
 
 # -------------------------
-# GEMINI TEXT ONLY
+# GEMINI TEXT
 # -------------------------
 def get_short_text(topic):
     if not GEMINI_API_KEY:
@@ -163,7 +143,7 @@ def get_short_text(topic):
         "contents": [
             {
                 "parts": [
-                    {"text": "Explain in one or two short sentences only: " + topic}
+                    {"text": "In 5 words only: " + topic}
                 ]
             }
         ]
@@ -173,12 +153,7 @@ def get_short_text(topic):
     res.raise_for_status()
 
     data = res.json()
-
-    text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    if not text:
-        raise RuntimeError("Gemini returned empty text")
-
-    return text
+    return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
 # -------------------------
@@ -316,8 +291,7 @@ def debug_image(topic):
             "topic": topic,
             "thumbnail_url": url,
             "cached_exists": os.path.exists(raw_path),
-            "raw_path": raw_path,
-            "raw_size": f"{RAW_W}x{RAW_H}"
+            "raw_path": raw_path
         })
     except Exception as e:
         return jsonify({
