@@ -1,4 +1,4 @@
-from flask import Flask, send_file, jsonify, request, Response
+from flask import Flask, jsonify, request, Response
 import os
 import re
 import requests
@@ -18,6 +18,10 @@ VOICERSS_KEY = os.environ.get("VOICERSS_KEY")
 HEADERS = {
     "User-Agent": "ESP32-Backend"
 }
+
+RAW_W = 320
+RAW_H = 160
+
 
 # -------------------------
 # HELPERS
@@ -48,8 +52,42 @@ def load_topic():
     return topic
 
 
+def center_crop_to_fill(img, target_w, target_h):
+    src_w, src_h = img.size
+    src_ratio = src_w / src_h
+    dst_ratio = target_w / target_h
+
+    if src_ratio > dst_ratio:
+        new_h = src_h
+        new_w = int(src_h * dst_ratio)
+        left = (src_w - new_w) // 2
+        top = 0
+    else:
+        new_w = src_w
+        new_h = int(src_w / dst_ratio)
+        left = 0
+        top = (src_h - new_h) // 2
+
+    right = left + new_w
+    bottom = top + new_h
+    return img.crop((left, top, right, bottom))
+
+
+def convert_image_to_raw(img, raw_path):
+    img = img.convert("RGB")
+    img = center_crop_to_fill(img, RAW_W, RAW_H)
+    img = img.resize((RAW_W, RAW_H))
+
+    with open(raw_path, "wb") as f:
+        for y in range(RAW_H):
+            for x in range(RAW_W):
+                r, g, b = img.getpixel((x, y))
+                rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+                f.write(bytes([(rgb565 >> 8) & 0xFF, rgb565 & 0xFF]))
+
+
 def make_gray_raw(raw_path):
-    img = Image.new("RGB", (320, 240), (96, 96, 96))
+    img = Image.new("RGB", (RAW_W, RAW_H), (96, 96, 96))
     convert_image_to_raw(img, raw_path)
     return raw_path
 
@@ -67,7 +105,7 @@ def wikipedia_thumbnail_url(topic):
         "gsrlimit": 1,
         "prop": "pageimages",
         "piprop": "thumbnail",
-        "pithumbsize": 640,
+        "pithumbsize": 800,
         "format": "json"
     }
 
@@ -84,18 +122,6 @@ def wikipedia_thumbnail_url(topic):
             return source
 
     return None
-
-
-def convert_image_to_raw(img, raw_path):
-    img = img.convert("RGB")
-    img = img.resize((320, 240))
-
-    with open(raw_path, "wb") as f:
-        for y in range(240):
-            for x in range(320):
-                r, g, b = img.getpixel((x, y))
-                rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-                f.write(bytes([(rgb565 >> 8) & 0xFF, rgb565 & 0xFF]))
 
 
 def fetch_and_convert(topic, force_refresh=False):
@@ -291,7 +317,8 @@ def debug_image(topic):
             "topic": topic,
             "thumbnail_url": url,
             "cached_exists": os.path.exists(raw_path),
-            "raw_path": raw_path
+            "raw_path": raw_path,
+            "raw_size": f"{RAW_W}x{RAW_H}"
         })
     except Exception as e:
         return jsonify({
