@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, Response
+from flask import Flask, send_file, jsonify, request, Response
 import os
 import re
 import requests
@@ -18,10 +18,6 @@ VOICERSS_KEY = os.environ.get("VOICERSS_KEY")
 HEADERS = {
     "User-Agent": "ESP32-Backend"
 }
-
-RAW_W = 320
-RAW_H = 240
-
 
 # -------------------------
 # HELPERS
@@ -53,7 +49,7 @@ def load_topic():
 
 
 def make_gray_raw(raw_path):
-    img = Image.new("RGB", (RAW_W, RAW_H), (96, 96, 96))
+    img = Image.new("RGB", (320, 240), (96, 96, 96))
     convert_image_to_raw(img, raw_path)
     return raw_path
 
@@ -92,11 +88,11 @@ def wikipedia_thumbnail_url(topic):
 
 def convert_image_to_raw(img, raw_path):
     img = img.convert("RGB")
-    img = img.resize((RAW_W, RAW_H))
+    img = img.resize((320, 240))
 
     with open(raw_path, "wb") as f:
-        for y in range(RAW_H):
-            for x in range(RAW_W):
+        for y in range(240):
+            for x in range(320):
                 r, g, b = img.getpixel((x, y))
                 rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
                 f.write(bytes([(rgb565 >> 8) & 0xFF, rgb565 & 0xFF]))
@@ -132,7 +128,7 @@ def fetch_and_convert(topic, force_refresh=False):
 
 
 # -------------------------
-# GEMINI TEXT ONLY
+# GEMINI TEXT
 # -------------------------
 def get_short_text(topic):
     if not GEMINI_API_KEY:
@@ -147,7 +143,7 @@ def get_short_text(topic):
         "contents": [
             {
                 "parts": [
-                    {"text": "Explain in one or two short sentences only: " + topic}
+                    {"text": "In 5 words only: " + topic}
                 ]
             }
         ]
@@ -157,12 +153,7 @@ def get_short_text(topic):
     res.raise_for_status()
 
     data = res.json()
-    text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-    if not text:
-        raise RuntimeError("Gemini returned empty text")
-
-    return text
+    return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
 # -------------------------
