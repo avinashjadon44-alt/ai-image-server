@@ -10,6 +10,8 @@ app = Flask(__name__)
 IMAGE_FOLDER = "images"
 os.makedirs(IMAGE_FOLDER, exist_ok=True)
 
+TOPIC_FILE = "current_topic.txt"
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 VOICERSS_KEY = os.environ.get("VOICERSS_KEY")
 
@@ -24,6 +26,25 @@ def normalize_topic(topic):
     topic = topic.strip().lower()
     topic = topic.replace(" ", "_")
     topic = re.sub(r"[^a-z0-9_()-]", "", topic)
+    return topic
+
+
+def save_topic(topic):
+    topic = topic.strip()
+    with open(TOPIC_FILE, "w", encoding="utf-8") as f:
+        f.write(topic)
+
+
+def load_topic():
+    if not os.path.exists(TOPIC_FILE):
+        return "taj mahal"
+
+    with open(TOPIC_FILE, "r", encoding="utf-8") as f:
+        topic = f.read().strip()
+
+    if not topic:
+        return "taj mahal"
+
     return topic
 
 
@@ -141,6 +162,62 @@ def get_short_text(topic):
 @app.route("/")
 def home():
     return "OK"
+
+
+@app.route("/topic_page")
+def topic_page():
+    current = load_topic()
+    return f"""
+    <html>
+    <head>
+        <title>Set Topic</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+    </head>
+    <body style="font-family: Arial, sans-serif; padding: 24px; background: #f5f5f5;">
+        <div style="max-width: 500px; margin: auto; background: white; padding: 24px; border-radius: 12px;">
+            <h2>Set ESP Topic</h2>
+            <form action="/set_topic" method="post">
+                <input
+                    type="text"
+                    name="topic"
+                    value="{current}"
+                    placeholder="Enter topic"
+                    style="width: 100%; height: 44px; font-size: 18px; padding: 8px; margin-bottom: 12px;"
+                />
+                <button
+                    type="submit"
+                    style="width: 100%; height: 44px; font-size: 18px; cursor: pointer;"
+                >
+                    Save Topic
+                </button>
+            </form>
+            <p style="margin-top: 16px;">
+                Current topic: <b>{current}</b>
+            </p>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.route("/set_topic", methods=["GET", "POST"])
+def set_topic():
+    if request.method == "POST":
+        topic = request.form.get("topic", "").strip()
+    else:
+        topic = request.args.get("topic", "").strip()
+
+    if not topic:
+        return jsonify({"ok": False, "error": "Missing topic"}), 400
+
+    save_topic(topic)
+    return jsonify({"ok": True, "topic": topic})
+
+
+@app.route("/get_topic")
+def get_topic():
+    topic = load_topic()
+    return jsonify({"topic": topic})
 
 
 @app.route("/image/<topic>")
