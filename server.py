@@ -23,9 +23,6 @@ RAW_W = 320
 RAW_H = 160
 
 
-# -------------------------
-# HELPERS
-# -------------------------
 def normalize_topic(topic):
     topic = topic.strip().lower()
     topic = topic.replace(" ", "_")
@@ -52,31 +49,25 @@ def load_topic():
     return topic
 
 
-def center_crop_to_fill(img, target_w, target_h):
+def fit_image_centered(img, target_w, target_h, bg_color=(255, 255, 255)):
+    img = img.convert("RGB")
     src_w, src_h = img.size
-    src_ratio = src_w / src_h
-    dst_ratio = target_w / target_h
 
-    if src_ratio > dst_ratio:
-        new_h = src_h
-        new_w = int(src_h * dst_ratio)
-        left = (src_w - new_w) // 2
-        top = 0
-    else:
-        new_w = src_w
-        new_h = int(src_w / dst_ratio)
-        left = 0
-        top = (src_h - new_h) // 2
+    scale = min(target_w / src_w, target_h / src_h)
+    new_w = max(1, int(src_w * scale))
+    new_h = max(1, int(src_h * scale))
 
-    right = left + new_w
-    bottom = top + new_h
-    return img.crop((left, top, right, bottom))
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+
+    canvas = Image.new("RGB", (target_w, target_h), bg_color)
+    x = (target_w - new_w) // 2
+    y = (target_h - new_h) // 2
+    canvas.paste(img, (x, y))
+    return canvas
 
 
 def convert_image_to_raw(img, raw_path):
-    img = img.convert("RGB")
-    img = center_crop_to_fill(img, RAW_W, RAW_H)
-    img = img.resize((RAW_W, RAW_H))
+    img = fit_image_centered(img, RAW_W, RAW_H)
 
     with open(raw_path, "wb") as f:
         for y in range(RAW_H):
@@ -92,9 +83,6 @@ def make_gray_raw(raw_path):
     return raw_path
 
 
-# -------------------------
-# IMAGE
-# -------------------------
 def wikipedia_thumbnail_url(topic):
     api_url = "https://en.wikipedia.org/w/api.php"
 
@@ -153,9 +141,6 @@ def fetch_and_convert(topic, force_refresh=False):
         return make_gray_raw(raw_path)
 
 
-# -------------------------
-# GEMINI TEXT
-# -------------------------
 def get_short_text(topic):
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY not set")
@@ -182,9 +167,6 @@ def get_short_text(topic):
     return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
-# -------------------------
-# ROUTES
-# -------------------------
 @app.route("/")
 def home():
     return "OK"
