@@ -1,6 +1,7 @@
 from flask import Flask, send_file, jsonify, request, Response
 import os
 import re
+import time
 import requests
 from PIL import Image
 from io import BytesIO
@@ -18,6 +19,8 @@ VOICERSS_KEY = os.environ.get("VOICERSS_KEY")
 HEADERS = {
     "User-Agent": "ESP32-Backend"
 }
+
+TEXT_CACHE = {}
 
 # -------------------------
 # HELPERS
@@ -128,9 +131,15 @@ def fetch_and_convert(topic, force_refresh=False):
 
 
 # -------------------------
-# GEMINI TEXT
+# GEMINI TEXT ONLY
 # -------------------------
 def get_short_text(topic):
+    topic_key = topic.strip().lower()
+
+    if topic_key in TEXT_CACHE:
+        print("Using cached Gemini text for:", topic_key)
+        return TEXT_CACHE[topic_key]
+
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY not set")
 
@@ -143,17 +152,44 @@ def get_short_text(topic):
         "contents": [
             {
                 "parts": [
-                    {"text": "In 5 words only: " + topic}
+                    {"text": "Explain in one or two short sentences only: " + topic}
                 ]
             }
         ]
     }
 
-    res = requests.post(url, json=payload, timeout=30)
-    res.raise_for_status()
+    last_error = None
 
-    data = res.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    for attempt in range(3):
+        try:
+            res = requests.post(url, json=payload, timeout=30)
+
+            if res.status_code == 429:
+                wait_s = 5 * (attempt + 1)
+                print(f"GEMINI 429 hit for '{topic}', retrying in {wait_s}s...")
+                time.sleep(wait_s)
+                last_error = RuntimeError("Gemini rate limit hit: HTTP 429")
+                continue
+
+            res.raise_for_status()
+
+            data = res.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+            if not text:
+                raise RuntimeError("Gemini returned empty text")
+
+            TEXT_CACHE[topic_key] = text
+            return text
+
+        except Exception as e:
+            last_error = e
+            print(f"GEMINI TEXT ERROR attempt {attempt + 1}: {e}")
+
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+
+    raise RuntimeError(f"Gemini text failed: {last_error}")
 
 
 # -------------------------
