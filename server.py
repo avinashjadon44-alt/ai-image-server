@@ -1,6 +1,7 @@
 from flask import Flask, send_file, jsonify, request, Response
 import os
 import re
+import json
 import requests
 from PIL import Image
 from io import BytesIO
@@ -11,6 +12,7 @@ IMAGE_FOLDER = "images"
 os.makedirs(IMAGE_FOLDER, exist_ok=True)
 
 TOPIC_FILE = "current_topic.txt"
+TEXT_CACHE_FILE = "text_cache.json"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 VOICERSS_KEY = os.environ.get("VOICERSS_KEY")
@@ -46,6 +48,22 @@ def load_topic():
         return "taj mahal"
 
     return topic
+
+
+def load_text_cache():
+    if not os.path.exists(TEXT_CACHE_FILE):
+        return {}
+
+    try:
+        with open(TEXT_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+
+
+def save_text_cache(cache):
+    with open(TEXT_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
 
 
 def make_gray_raw(raw_path):
@@ -128,9 +146,16 @@ def fetch_and_convert(topic, force_refresh=False):
 
 
 # -------------------------
-# GEMINI TEXT
+# GEMINI TEXT ONLY
 # -------------------------
 def get_short_text(topic):
+    cache = load_text_cache()
+    topic_key = normalize_topic(topic)
+
+    if topic_key in cache:
+        print("Using cached Gemini text:", topic_key)
+        return cache[topic_key]
+
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY not set")
 
@@ -150,10 +175,22 @@ def get_short_text(topic):
     }
 
     res = requests.post(url, json=payload, timeout=30)
+
+    if res.status_code == 429:
+        raise RuntimeError("Gemini rate limit hit. Please wait and try again.")
+
     res.raise_for_status()
 
     data = res.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+    if not text:
+        raise RuntimeError("Gemini returned empty text")
+
+    cache[topic_key] = text
+    save_text_cache(cache)
+
+    return text
 
 
 # -------------------------
@@ -291,7 +328,8 @@ def debug_image(topic):
             "topic": topic,
             "thumbnail_url": url,
             "cached_exists": os.path.exists(raw_path),
-            "raw_path": raw_path
+            "raw_path": raw_path,
+            "text_cache_exists": topic in load_text_cache() or normalize_topic(topic) in load_text_cache()
         })
     except Exception as e:
         return jsonify({
