@@ -295,15 +295,15 @@ def tts():
     url = (
         "https://api.voicerss.org/?key=" + VOICERSS_KEY +
         "&hl=en-us&src=" + requests.utils.quote(text) +
-        "&f=16khz_16bit_mono&c=WAV"
+        "&f=8khz_8bit_mono_pcm&codec=PCM"
     )
 
     r = requests.get(url, stream=True, timeout=30)
     r.raise_for_status()
 
     return Response(
-        r.iter_content(1024),
-        content_type="audio/wav"
+        r.iter_content(512),
+        content_type="application/octet-stream"
     )
 
 
@@ -324,13 +324,12 @@ def debug_image(topic):
         safe = normalize_topic(topic)
         raw_path = os.path.join(IMAGE_FOLDER, safe + ".raw")
 
-        cache = load_text_cache()
         return jsonify({
             "topic": topic,
             "thumbnail_url": url,
             "cached_exists": os.path.exists(raw_path),
             "raw_path": raw_path,
-            "text_cache_exists": normalize_topic(topic) in cache
+            "text_cache_exists": topic in load_text_cache() or normalize_topic(topic) in load_text_cache()
         })
     except Exception as e:
         return jsonify({
