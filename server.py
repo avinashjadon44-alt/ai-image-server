@@ -317,7 +317,8 @@ def full(topic):
         return jsonify({"text": text})
     except Exception as e:
         print("FULL ERROR:", str(e))
-        return jsonify({"error": str(e)}), 500
+        fallback_text = f"{topic} information not available"
+        return jsonify({"text": fallback_text})
 
 
 @app.route("/debug_image/<topic>")
