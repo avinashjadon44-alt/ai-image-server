@@ -179,6 +179,9 @@ def get_short_text(topic):
     if res.status_code == 429:
         raise RuntimeError("Gemini rate limit hit. Please wait and try again.")
 
+    if res.status_code == 503:
+        raise RuntimeError("Gemini service temporarily unavailable. Please try again.")
+
     res.raise_for_status()
 
     data = res.json()
@@ -295,7 +298,7 @@ def tts():
     url = (
         "https://api.voicerss.org/?key=" + VOICERSS_KEY +
         "&hl=en-us&src=" + requests.utils.quote(text) +
-        "&f=8khz_8bit_mono_pcm&codec=PCM"
+        "&f=8khz_8bit_mono&c=WAV"
     )
 
     r = requests.get(url, stream=True, timeout=30)
@@ -303,7 +306,7 @@ def tts():
 
     return Response(
         r.iter_content(512),
-        content_type="application/octet-stream"
+        content_type="audio/wav"
     )
 
 
