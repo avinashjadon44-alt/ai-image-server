@@ -298,16 +298,25 @@ def tts():
     url = (
         "https://api.voicerss.org/?key=" + VOICERSS_KEY +
         "&hl=en-us&src=" + requests.utils.quote(text) +
-        "&f=8khz_8bit_mono&c=WAV"
+        "&c=WAV&f=8khz_8bit_mono"
     )
 
-    r = requests.get(url, stream=True, timeout=30)
-    r.raise_for_status()
+    r = requests.get(url, timeout=30)
 
-    return Response(
-        r.iter_content(512),
-        content_type="audio/wav"
-    )
+    if not r.ok:
+        return Response("VoiceRSS request failed", status=500)
+
+    data = r.content
+
+    if len(data) < 12 or data[0:4] != b"RIFF" or data[8:12] != b"WAVE":
+        print("TTS RAW RESPONSE:")
+        try:
+            print(data.decode("utf-8", errors="ignore"))
+        except Exception:
+            print(data[:100])
+        return Response("TTS did not return valid WAV", status=500)
+
+    return Response(data, content_type="audio/wav")
 
 
 @app.route("/full/<topic>")
