@@ -1,4 +1,4 @@
-from flask import Flask, send_file, jsonify, request, Response
+from flask import Flask, jsonify, request, Response
 import os
 import re
 import json
@@ -57,7 +57,7 @@ def load_text_cache():
     try:
         with open(TEXT_CACHE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except Exception:
         return {}
 
 
@@ -327,12 +327,14 @@ def debug_image(topic):
         safe = normalize_topic(topic)
         raw_path = os.path.join(IMAGE_FOLDER, safe + ".raw")
 
+        cache = load_text_cache()
+
         return jsonify({
             "topic": topic,
             "thumbnail_url": url,
             "cached_exists": os.path.exists(raw_path),
             "raw_path": raw_path,
-            "text_cache_exists": topic in load_text_cache() or normalize_topic(topic) in load_text_cache()
+            "text_cache_exists": normalize_topic(topic) in cache
         })
     except Exception as e:
         return jsonify({
