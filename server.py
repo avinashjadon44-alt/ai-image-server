@@ -6,6 +6,8 @@ import requests
 from PIL import Image
 from io import BytesIO
 
+print("OPENAI KEY:", os.environ.get("OPENAI_API_KEY"))
+
 app = Flask(__name__)
 
 IMAGE_FOLDER = "images"
