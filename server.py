@@ -2,11 +2,10 @@ from flask import Flask, jsonify, request, Response
 import os
 import re
 import json
-import tempfile
+import random
 import requests
 from PIL import Image
 from io import BytesIO
-from openai import OpenAI
 
 app = Flask(__name__)
 
@@ -18,9 +17,6 @@ TEXT_CACHE_FILE = "text_cache.json"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 VOICERSS_KEY = os.environ.get("VOICERSS_KEY")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 HEADERS = {
     "User-Agent": "ESP32-Backend"
@@ -202,53 +198,6 @@ def get_short_text(topic):
 
 
 # -------------------------
-# OPENAI SPEECH -> TOPIC
-# -------------------------
-def transcribe_audio_to_topic(file_storage) -> str:
-    if not openai_client:
-        raise RuntimeError("OPENAI_API_KEY not set")
-
-    temp_path = None
-    try:
-        suffix = ".wav"
-        filename = getattr(file_storage, "filename", "") or ""
-        if "." in filename:
-            ext = "." + filename.rsplit(".", 1)[1].lower()
-            if len(ext) <= 6:
-                suffix = ext
-
-        fd, temp_path = tempfile.mkstemp(suffix=suffix)
-        os.close(fd)
-        file_storage.save(temp_path)
-
-        with open(temp_path, "rb") as audio_file:
-            transcript = openai_client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=audio_file,
-                response_format="json"
-            )
-
-        text = (getattr(transcript, "text", "") or "").strip().lower()
-
-        print("Detected speech:", text)
-
-        if not text:
-            raise RuntimeError("No speech detected")
-
-        # First version: use the spoken text directly as topic
-        topic = text
-        save_topic(topic)
-        return topic
-
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
-
-
-# -------------------------
 # ROUTES
 # -------------------------
 @app.route("/")
@@ -312,18 +261,36 @@ def get_topic():
     return jsonify({"topic": topic})
 
 
+# -------------------------
+# FREE TEST MODE FOR SPEECH
+# -------------------------
 @app.route("/speech_topic", methods=["POST"])
 def speech_topic():
     try:
-        if "audio" not in request.files:
-            return jsonify({"error": "No audio file uploaded"}), 400
+        print("Speech request received")
 
-        topic = transcribe_audio_to_topic(request.files["audio"])
+        test_topics = [
+            "taj mahal",
+            "delhi",
+            "lion",
+            "apple",
+            "moon",
+            "eiffel tower",
+            "peacock",
+            "red fort",
+            "banana",
+            "japan"
+        ]
+
+        topic = random.choice(test_topics)
+        save_topic(topic)
+
+        print("Returning test topic:", topic)
         return jsonify({"topic": topic})
 
     except Exception as e:
         print("SPEECH_TOPIC ERROR:", str(e))
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"topic": "taj mahal"})
 
 
 @app.route("/image/<topic>")
@@ -367,12 +334,19 @@ def tts():
         "&f=8khz_8bit_mono&c=WAV"
     )
 
-    r = requests.get(url, stream=True, timeout=30)
-    r.raise_for_status()
+    r = requests.get(url, timeout=30)
+
+    if not r.ok:
+        return Response("VoiceRSS request failed", status=500)
 
     data = r.content
+
     if len(data) < 12 or data[0:4] != b"RIFF" or data[8:12] != b"WAVE":
-        print("TTS RAW RESPONSE:", data[:120])
+        print("TTS RAW RESPONSE:")
+        try:
+            print(data.decode("utf-8", errors="ignore"))
+        except Exception:
+            print(data[:100])
         return Response("TTS did not return valid WAV", status=500)
 
     return Response(data, content_type="audio/wav")
@@ -395,6 +369,7 @@ def debug_image(topic):
         url = wikipedia_thumbnail_url(topic)
         safe = normalize_topic(topic)
         raw_path = os.path.join(IMAGE_FOLDER, safe + ".raw")
+
         cache = load_text_cache()
 
         return jsonify({
