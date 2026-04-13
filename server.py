@@ -2,11 +2,11 @@ from flask import Flask, jsonify, request, Response
 import os
 import re
 import json
-import tempfile
+import time
+import random
 import requests
 from PIL import Image
 from io import BytesIO
-from openai import OpenAI
 
 app = Flask(__name__)
 
@@ -18,9 +18,6 @@ TEXT_CACHE_FILE = "text_cache.json"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 VOICERSS_KEY = os.environ.get("VOICERSS_KEY")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 HEADERS = {
     "User-Agent": "ESP32-Backend"
@@ -75,6 +72,10 @@ def make_gray_raw(raw_path):
     img = Image.new("RGB", (320, 240), (96, 96, 96))
     convert_image_to_raw(img, raw_path)
     return raw_path
+
+
+def fallback_text(topic):
+    return f"{topic} information not available"
 
 
 # -------------------------
@@ -151,16 +152,9 @@ def fetch_and_convert(topic, force_refresh=False):
 
 
 # -------------------------
-# GEMINI TEXT ONLY
+# GEMINI TEXT WITH CACHE
 # -------------------------
-def get_short_text(topic):
-    cache = load_text_cache()
-    topic_key = normalize_topic(topic)
-
-    if topic_key in cache:
-        print("Using cached Gemini text:", topic_key)
-        return cache[topic_key]
-
+def fetch_gemini_once(topic):
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY not set")
 
@@ -190,62 +184,52 @@ def get_short_text(topic):
     res.raise_for_status()
 
     data = res.json()
-    text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
+    candidates = data.get("candidates", [])
+    if not candidates:
+        raise RuntimeError("Gemini returned no candidates")
+
+    content = candidates[0].get("content", {})
+    parts = content.get("parts", [])
+    if not parts:
+        raise RuntimeError("Gemini returned no text parts")
+
+    text = parts[0].get("text", "").strip()
     if not text:
         raise RuntimeError("Gemini returned empty text")
-
-    cache[topic_key] = text
-    save_text_cache(cache)
 
     return text
 
 
-# -------------------------
-# OPENAI SPEECH -> TOPIC
-# -------------------------
-def transcribe_audio_to_topic(file_storage) -> str:
-    if not openai_client:
-        raise RuntimeError("OPENAI_API_KEY not set")
+def get_short_text(topic):
+    cache = load_text_cache()
+    topic_key = normalize_topic(topic)
 
-    temp_path = None
-    try:
-        suffix = ".wav"
-        filename = getattr(file_storage, "filename", "") or ""
-        if "." in filename:
-            ext = "." + filename.rsplit(".", 1)[1].lower()
-            if len(ext) <= 6:
-                suffix = ext
+    if topic_key in cache and cache[topic_key].strip():
+        print("Using cached Gemini text:", topic_key)
+        return cache[topic_key]
 
-        fd, temp_path = tempfile.mkstemp(suffix=suffix)
-        os.close(fd)
-        file_storage.save(temp_path)
+    last_error = None
 
-        with open(temp_path, "rb") as audio_file:
-            transcript = openai_client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=audio_file,
-                response_format="json"
-            )
+    for attempt in range(2):
+        try:
+            print(f"Gemini fetch attempt {attempt + 1} for topic: {topic}")
+            text = fetch_gemini_once(topic)
 
-        text = (getattr(transcript, "text", "") or "").strip().lower()
+            cache[topic_key] = text
+            save_text_cache(cache)
 
-        print("Detected speech:", text)
+            print("Gemini text cached for:", topic_key)
+            return text
 
-        if not text:
-            raise RuntimeError("No speech detected")
+        except Exception as e:
+            last_error = str(e)
+            print("GEMINI ERROR:", last_error)
 
-        # First version: use the spoken text directly as topic
-        topic = text
-        save_topic(topic)
-        return topic
+            if attempt == 0:
+                time.sleep(2)
 
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
+    raise RuntimeError(last_error or "Unknown Gemini failure")
 
 
 # -------------------------
@@ -312,18 +296,36 @@ def get_topic():
     return jsonify({"topic": topic})
 
 
+# -------------------------
+# FREE TEST MODE FOR SPEECH
+# -------------------------
 @app.route("/speech_topic", methods=["POST"])
 def speech_topic():
     try:
-        if "audio" not in request.files:
-            return jsonify({"error": "No audio file uploaded"}), 400
+        print("Speech request received")
 
-        topic = transcribe_audio_to_topic(request.files["audio"])
+        test_topics = [
+            "taj mahal",
+            "delhi",
+            "lion",
+            "apple",
+            "moon",
+            "eiffel tower",
+            "peacock",
+            "red fort",
+            "banana",
+            "japan"
+        ]
+
+        topic = random.choice(test_topics)
+        save_topic(topic)
+
+        print("Returning test topic:", topic)
         return jsonify({"topic": topic})
 
     except Exception as e:
         print("SPEECH_TOPIC ERROR:", str(e))
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"topic": "taj mahal"})
 
 
 @app.route("/image/<topic>")
@@ -367,12 +369,19 @@ def tts():
         "&f=8khz_8bit_mono&c=WAV"
     )
 
-    r = requests.get(url, stream=True, timeout=30)
-    r.raise_for_status()
+    r = requests.get(url, timeout=30)
+
+    if not r.ok:
+        return Response("VoiceRSS request failed", status=500)
 
     data = r.content
+
     if len(data) < 12 or data[0:4] != b"RIFF" or data[8:12] != b"WAVE":
-        print("TTS RAW RESPONSE:", data[:120])
+        print("TTS RAW RESPONSE:")
+        try:
+            print(data.decode("utf-8", errors="ignore"))
+        except Exception:
+            print(data[:100])
         return Response("TTS did not return valid WAV", status=500)
 
     return Response(data, content_type="audio/wav")
@@ -386,11 +395,13 @@ def full(topic):
     except Exception as e:
         print("FULL ERROR FOR TOPIC:", topic)
         print("FULL ERROR DETAILS:", str(e))
-        fallback_text = f"{topic} information not available"
+
+        fallback = fallback_text(topic)
         return jsonify({
-            "text": fallback_text,
+            "text": fallback,
             "debug_error": str(e)
         })
+
 
 @app.route("/debug_image/<topic>")
 def debug_image(topic):
@@ -398,6 +409,7 @@ def debug_image(topic):
         url = wikipedia_thumbnail_url(topic)
         safe = normalize_topic(topic)
         raw_path = os.path.join(IMAGE_FOLDER, safe + ".raw")
+
         cache = load_text_cache()
 
         return jsonify({
@@ -412,6 +424,15 @@ def debug_image(topic):
             "topic": topic,
             "error": str(e)
         }), 500
+
+
+@app.route("/debug_cache")
+def debug_cache():
+    cache = load_text_cache()
+    return jsonify({
+        "count": len(cache),
+        "topics": sorted(list(cache.keys()))
+    })
 
 
 if __name__ == "__main__":
